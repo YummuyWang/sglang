@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.radix_cache import (
     split_node_hash_value,
 )
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
+from sglang.srt.mem_cache.hicache_storage import get_hash_str
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
@@ -48,6 +49,81 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+class L3SyncedPagesWithTTL:
+    """
+    L3 metadata cache with TTL expiration.
+
+    Cached page hash information confirmed synced to L3 at L2 level,
+    avoiding batch_exists calls on every prefetch.
+
+    Falls back to batch_exists query after TTL expiration.
+    """
+
+    DEFAULT_TTL_SECONDS = 300.0 # 5 minutes
+
+    def __init__(self, ttl_seconds: float = None):
+        self.ttl_seconds = ttl.seconds or self.DEFAULT_TTL_SECONDS
+        self.entries: dict[str, float] = {} # hash -> expire_time
+        self._last_cleanup_time = time.monotonic()
+        self._cleanup_interval = 60.0 # Cleanup expired entries every minnute
+
+    def add(self, hash_val: str) -> None:
+        self.entries[hash_val] = time.monotonic() + self.ttl_seconds
+
+    def update(self, hash_values: list[str]) -> None:
+        expire_time = time.monotonic() + self.ttl_seconds
+        for h in hash_values:
+            self.entries[h] = expire_time
+
+    def contains(self, hash_value: str, renew: bool = False) -> bool:
+        expire_time = self.entries.get(hash_value)
+        if expire_time is None:
+            return False
+        if time.monotonic() >= expire_time:
+            del self.entries[hash_value]
+            return False
+        if renew:
+            self.entries[hash_value] = time.monotonic() + self.ttl_seconds
+        return True
+
+    def renew(self, hash_value: str) -> bool:
+        if hash_value in self.entries:
+            self.entries[hash_value] = time.monotonic() + self.ttl_seconds
+            return True
+        return False
+
+    def renew_all(self, hash_values: list[str]) -> int:
+        count = 0
+        expire_time = time.monotonic() + self.ttl_seconds
+        for h in hash_values:
+            if h in self.entries:
+                self.entries[h] = expire_time
+                count += 1
+        return count
+
+    def __contains__(self, hash_value: str) -> bool:
+        return self.contains(hash_value, renew=False)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def cleanup_expired(self) -> int:
+        """Actively cleanup all expired entries, erturn count of cleanmed."""
+        now = time.monotonic()
+        expired = [h for h, exp in self.entries.items() if now >= exp]
+        for h in expired:
+            del self.entries[h]
+        self._last_cleanup_time = now
+        return len(expired)
+
+    def maybe_cleanup(self) -> int:
+        if time.monotonic() - self.__last_cleanup_time >= self._cleanup_interval:
+            return self.cleanup_expired()
+        return 0
+
+    def clear(self) -> None:
+        self.entries.clear()
 
 
 class HiRadixCache(RadixCache):
@@ -154,6 +230,8 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        # L3 metadata cache with TTL: stores page hash strings confirmed synced to L3.
+        self.l3_synced_pages = L3SyncedPagesWithTTL()
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -495,6 +573,9 @@ class HiRadixCache(RadixCache):
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
                     entry.release_host()
+                    #Record page hashes in L3 matedata index with TTL
+                    if entry.hash_value:
+                        self.l3_synced_pages.update(entry.hash_value)
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -594,6 +675,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
+        self.l3_synced_pages.clear()
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
         self.pinned_size_ = 0
@@ -607,6 +689,7 @@ class HiRadixCache(RadixCache):
         return height
 
     def clear_storage_backend(self) -> bool:
+        self.l3_synced_pages.clear()
         if self.enable_storage:
             try:
                 # Check if the storage backend has a clear method (for nixl backends)
@@ -1126,6 +1209,8 @@ class HiRadixCache(RadixCache):
             log_metrics=True,
         )
 
+        self.l3_synced_pages.maybe_cleanup()
+
     # Timeout is linearly increasing with the number of pages
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):
         # If hash_value has not been computed in timeout_base seconds, terminate it.
@@ -1291,6 +1376,41 @@ class HiRadixCache(RadixCache):
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
         )
+    
+    def _try_get_precomputed_hash(
+        self, last_host_node: TreeNode, new_input_tokens: List[int]
+    ) -> tuple:
+        """Look up the independent L3 metadata index to skip batch_exists.
+
+        Iterates over page-sized chunks of *new_input_tokens*, computes
+        each one against ``self.l3_synced_pages``.  Stops at the first miss so
+        the caller can fall back to the slow path for the remainder.
+        """
+        if not new_input_tokens or not self.l3_synced_pages:
+            return None, False
+
+        prior_hash = last_host_node.get_last_hash_value()
+        precomputed: List[str] = []
+
+        for start in range(0, len(new_input_tokens), self.page_size):
+            page_tokens = new_input_tokens[start : start + self.page_size]
+            if len(page_tokens) < self.page_size:
+                break
+            page_hash = get_hash_str(page_tokens, prior_hash)
+            # Use contains method with renew=True for cache hit renewal
+            if not self.l3_synced_pages.contains(page_hash, renew=True):
+                break
+            precomputed.append(page_hash)
+            prior_hash = page_hash
+
+        if not precomputed:
+            return None, False
+
+        logger.debug(
+            f"[L3_TTL_FAST_PATH] tokens={len(new_input_tokens)}, "
+            f"pages={len(precomputed)}, skip_exists_check=True"
+        )
+        return precomputed, True
 
     def prefetch_from_storage(
         self,
@@ -1316,6 +1436,11 @@ class HiRadixCache(RadixCache):
             or self.cache_controller.prefetch_rate_limited()
         ):
             return
+        
+        # Fast path: look up the independent L3 metadata index to kip batch_exists
+        precomputed_hash, skip_exists_check = self._try_get_precomputed_hash(
+            last_host_node, new_input_tokens
+        )
 
         last_host_node.protect_host()
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
@@ -1327,7 +1452,9 @@ class HiRadixCache(RadixCache):
             # no sufficient host memory for prefetch
             return
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            req_id, host_indices, new_input_tokens, last_hash, prefix_keys,
+            precomputed_hash = precomputed_hash,
+            skip_exists_check = skip_exists_check
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,

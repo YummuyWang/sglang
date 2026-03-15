@@ -220,12 +220,17 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        precomputed_hash = None,
+        skip_exists_check: bool = False,
     ):
         self.request_id = request_id
 
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        # Fastpath : use precomputed hash values from L3 metadata index with TTL
+        self.precomputed_hash = precomputed_hash
+        self.skip_exists_check = skip_exists_check
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -790,12 +795,16 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        computed_hash = None,
+        skip_exists_check : bool = False,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id, host_indices, new_input_tokens, last_hash, prefix_keys,
+            precomputed_hash = precomputed_hash,
+            skip_exists_check = skip_exists_check
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -907,6 +916,16 @@ class HiCacheController:
 
         storage_query_count = 0
         hash_value = []
+
+        # Fast path
+        if operation.skip_exists_check and operation.precomputed_hash:
+            # Skip bach_exists entirely for precomputed hashes
+            hash_value = operation.precomputed_hash.copy()
+            storage_query_count = len(hash_value) * self.page_size
+            logger.debug(
+                f"[L3_TTL_FAST_PATH] Skipped batch_exists for {len(hash_value)} pages"
+            )
+            return hash_value, storage_query_count
 
         for start in range(
             0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
