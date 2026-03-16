@@ -795,8 +795,8 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
-        computed_hash = None,
-        skip_exists_check : bool = False,
+        precomputed_hash: Optional[List[str]] = None,
+        skip_exists_check: bool = False,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
