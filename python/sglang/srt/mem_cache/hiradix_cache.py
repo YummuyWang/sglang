@@ -63,7 +63,7 @@ class L3SyncedPagesWithTTL:
     DEFAULT_TTL_SECONDS = 300.0 # 5 minutes
 
     def __init__(self, ttl_seconds: float = None):
-        self.ttl_seconds = ttl.seconds or self.DEFAULT_TTL_SECONDS
+        self.ttl_seconds = ttl_seconds or self.DEFAULT_TTL_SECONDS
         self.entries: dict[str, float] = {} # hash -> expire_time
         self._last_cleanup_time = time.monotonic()
         self._cleanup_interval = 60.0 # Cleanup expired entries every minnute
