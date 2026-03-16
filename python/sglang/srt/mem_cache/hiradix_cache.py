@@ -118,7 +118,7 @@ class L3SyncedPagesWithTTL:
         return len(expired)
 
     def maybe_cleanup(self) -> int:
-        if time.monotonic() - self.__last_cleanup_time >= self._cleanup_interval:
+        if time.monotonic() - self._last_cleanup_time >= self._cleanup_interval:
             return self.cleanup_expired()
         return 0
 
